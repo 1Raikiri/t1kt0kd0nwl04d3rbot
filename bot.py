@@ -25,7 +25,7 @@ logger = logging.getLogger(__name__)
 
 # ── Конфиг ───────────────────────────────────────────────────────────────────
 BOT_TOKEN = os.environ["BOT_TOKEN"]
-CHANNEL = "@asiadvizh"
+CHANNEL = "@nasvaivolne"
 
 RATE_LIMIT = 3
 RATE_WINDOW = 60
@@ -56,7 +56,7 @@ async def is_subscribed(user_id: int, ctx: ContextTypes.DEFAULT_TYPE) -> bool:
 
 def subscription_keyboard() -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup([
-        [InlineKeyboardButton("📢 Подписаться на канал", url="https://t.me/asiadvizh")],
+        [InlineKeyboardButton("📢 Подписаться на канал", url="https://t.me/nasvaivolne")],
         [InlineKeyboardButton("✅ Я подписался", callback_data="check_sub")],
     ])
 
