@@ -37,6 +37,7 @@ TIKTOK_RE = re.compile(
 )
 
 TIKWM_API = "https://www.tikwm.com/api/"
+TIKWM_BASE_URL = "https://www.tikwm.com"
 TIKWM_HEADERS = {
     "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
     "Accept": "application/json, text/javascript, */*; q=0.01",
@@ -72,6 +73,17 @@ def subscription_keyboard() -> InlineKeyboardMarkup:
         [InlineKeyboardButton("📢 Подписаться на канал", url="https://t.me/nasvaivolne")],
         [InlineKeyboardButton("✅ Я подписался", callback_data="check_sub")],
     ])
+
+# ── tikwm: нормализация ссылок ────────────────────────────────────────────────
+def tikwm_full_url(url: str | None) -> str | None:
+    """tikwm иногда отдаёт относительные пути (начинаются с '/') вместо полных
+    URL. requests падает на таких ссылках с MissingSchema — здесь достраиваем
+    хост, если его не было."""
+    if not url:
+        return url
+    if url.startswith("http://") or url.startswith("https://"):
+        return url
+    return TIKWM_BASE_URL + url
 
 # ── tikwm API (видео + фото) ──────────────────────────────────────────────────
 def tikwm_fetch(url: str) -> dict | None:
@@ -195,7 +207,7 @@ async def process_url(update: Update, ctx: ContextTypes.DEFAULT_TYPE, url: str):
                 await status_msg.edit_text(f"🖼 Отправляю {len(images)} фото...")
                 media_group = []
                 for i, img_url in enumerate(images[:10]):
-                    img_resp = requests.get(img_url, headers=TIKWM_HEADERS, timeout=15)
+                    img_resp = requests.get(tikwm_full_url(img_url), headers=TIKWM_HEADERS, timeout=15)
                     caption = "🖼 Без водяного знака" if i == 0 else None
                     media_group.append(InputMediaPhoto(media=img_resp.content, caption=caption))
                 await msg.reply_media_group(media=media_group)
@@ -203,7 +215,7 @@ async def process_url(update: Update, ctx: ContextTypes.DEFAULT_TYPE, url: str):
                 return
 
             # ── Видео через tikwm ─────────────────────────────────────────────
-            play_url = data.get("hdplay") or data.get("play")
+            play_url = tikwm_full_url(data.get("hdplay") or data.get("play"))
             if play_url:
                 await status_msg.edit_text("⏬ Скачиваю видео...")
                 video_resp = requests.get(play_url, headers=TIKWM_HEADERS, timeout=60, stream=True)
@@ -250,8 +262,8 @@ async def process_url(update: Update, ctx: ContextTypes.DEFAULT_TYPE, url: str):
             "• Ссылка устарела\n\n"
             "Попробуй скопировать ссылку заново."
         )
-    except Exception as e:
-        logger.error(f"Неожиданная ошибка: {e}", exc_info=True)
+    except Exception:
+        logger.exception("Неожиданная ошибка")
         await status_msg.edit_text("⚠️ Что-то пошло не так. Попробуй позже.")
 
 # ── Запуск ────────────────────────────────────────────────────────────────────
