@@ -44,18 +44,38 @@ INSTAGRAM_RE = re.compile(
 
 # Cookies для Instagram можно передать двумя способами:
 # 1. INSTAGRAM_COOKIES_CONTENT — содержимое cookies.txt прямо в переменной окружения
-#    (удобно для Railway: вставляешь весь текст файла как значение переменной)
-# 2. INSTAGRAM_COOKIES_FILE — путь к файлу с cookies на диске (если он есть в репозитории)
-INSTAGRAM_COOKIES_CONTENT = os.environ.get("INSTAGRAM_COOKIES_CONTENT")
-INSTAGRAM_COOKIES_FILE = os.environ.get("INSTAGRAM_COOKIES_FILE")
+# 2. INSTAGRAM_COOKIES_FILE — путь к файлу с cookies на диске
+# Ниже — устойчивая к человеческим ошибкам логика: если в любой из двух
+# переменных лежит содержимое файла (а не путь), мы это определяем
+# и сами сохраняем во временный файл.
+def _resolve_instagram_cookies() -> str | None:
+    raw_content = os.environ.get("INSTAGRAM_COOKIES_CONTENT")
+    raw_file = os.environ.get("INSTAGRAM_COOKIES_FILE")
 
-if INSTAGRAM_COOKIES_CONTENT and not INSTAGRAM_COOKIES_FILE:
-    # Записываем содержимое во временный файл, т.к. yt-dlp требует путь к файлу
-    _cookies_path = os.path.join(tempfile.gettempdir(), "instagram_cookies.txt")
-    with open(_cookies_path, "w", encoding="utf-8") as _f:
-        _f.write(INSTAGRAM_COOKIES_CONTENT)
-    INSTAGRAM_COOKIES_FILE = _cookies_path
-    logger.info("Instagram cookies загружены из переменной окружения")
+    candidates = [raw_content, raw_file]
+    for value in candidates:
+        if not value:
+            continue
+        # Если значение выглядит как содержимое cookies-файла (есть символы
+        # новой строки или начинается с "# Netscape"), а не как путь к файлу —
+        # сохраняем его во временный файл.
+        looks_like_content = "\n" in value or value.strip().startswith("#")
+        if looks_like_content:
+            cookies_path = os.path.join(tempfile.gettempdir(), "instagram_cookies.txt")
+            with open(cookies_path, "w", encoding="utf-8") as f:
+                f.write(value)
+            logger.info("Instagram cookies: содержимое сохранено во временный файл")
+            return cookies_path
+        # Иначе это похоже на путь к существующему файлу
+        if os.path.exists(value):
+            logger.info(f"Instagram cookies: используется файл по пути {value}")
+            return value
+        logger.warning(f"Instagram cookies: значение '{value[:50]}...' — это не существующий путь и не похоже на содержимое cookies")
+
+    logger.info("Instagram cookies не настроены (ни CONTENT, ни FILE)")
+    return None
+
+INSTAGRAM_COOKIES_FILE = _resolve_instagram_cookies()
 
 TIKWM_API = "https://www.tikwm.com/api/"
 TIKWM_HEADERS = {
@@ -142,7 +162,7 @@ def detect_url(text: str) -> tuple[str | None, str | None]:
 def download_video_ytdlp(url: str, output_path: str) -> str:
     ydl_opts = {
         "outtmpl": output_path,
-        "format": "bestvideo[ext=mp4]+bestaudio[ext=m4a]/best[ext=mp4]/best",
+        "format": "best[ext=mp4]/best",
         "quiet": True,
         "no_warnings": True,
         "http_headers": YDL_HEADERS,
