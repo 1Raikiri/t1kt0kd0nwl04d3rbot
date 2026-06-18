@@ -42,9 +42,20 @@ INSTAGRAM_RE = re.compile(
     re.IGNORECASE,
 )
 
-# Опциональный файл с cookies для Instagram (нужен для части reels/историй,
-# которые Instagram отдаёт только авторизованным сессиям).
+# Cookies для Instagram можно передать двумя способами:
+# 1. INSTAGRAM_COOKIES_CONTENT — содержимое cookies.txt прямо в переменной окружения
+#    (удобно для Railway: вставляешь весь текст файла как значение переменной)
+# 2. INSTAGRAM_COOKIES_FILE — путь к файлу с cookies на диске (если он есть в репозитории)
+INSTAGRAM_COOKIES_CONTENT = os.environ.get("INSTAGRAM_COOKIES_CONTENT")
 INSTAGRAM_COOKIES_FILE = os.environ.get("INSTAGRAM_COOKIES_FILE")
+
+if INSTAGRAM_COOKIES_CONTENT and not INSTAGRAM_COOKIES_FILE:
+    # Записываем содержимое во временный файл, т.к. yt-dlp требует путь к файлу
+    _cookies_path = os.path.join(tempfile.gettempdir(), "instagram_cookies.txt")
+    with open(_cookies_path, "w", encoding="utf-8") as _f:
+        _f.write(INSTAGRAM_COOKIES_CONTENT)
+    INSTAGRAM_COOKIES_FILE = _cookies_path
+    logger.info("Instagram cookies загружены из переменной окружения")
 
 TIKWM_API = "https://www.tikwm.com/api/"
 TIKWM_HEADERS = {
