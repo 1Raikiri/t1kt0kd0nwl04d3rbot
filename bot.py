@@ -158,8 +158,15 @@ def detect_url(text: str) -> tuple[str | None, str | None]:
         return "instagram", match.group(0)
     return None, None
 
-# ── yt-dlp скачивание видео ───────────────────────────────────────────────────
-def download_video_ytdlp(url: str, output_path: str) -> str:
+# ── yt-dlp скачивание видео/фото ──────────────────────────────────────────────
+def download_instagram_ytdlp(url: str, tmpdir: str) -> dict:
+    """
+    Скачивает контент из Instagram через yt-dlp.
+    Возвращает dict: {"type": "video", "path": str} или
+                      {"type": "images", "paths": [str, ...]}
+    Поднимает yt_dlp.utils.DownloadError при неудаче.
+    """
+    output_path = os.path.join(tmpdir, "media.%(ext)s")
     ydl_opts = {
         "outtmpl": output_path,
         "format": "best[ext=mp4]/best",
@@ -167,8 +174,59 @@ def download_video_ytdlp(url: str, output_path: str) -> str:
         "no_warnings": True,
         "http_headers": YDL_HEADERS,
     }
-    if INSTAGRAM_COOKIES_FILE and "instagram.com" in url:
+    if INSTAGRAM_COOKIES_FILE:
         ydl_opts["cookiefile"] = INSTAGRAM_COOKIES_FILE
+
+    with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+        info = ydl.extract_info(url, download=True)
+
+        # Пост может быть каруселью из нескольких элементов (entries)
+        entries = info.get("entries") if info.get("_type") == "playlist" else [info]
+
+        video_paths = []
+        image_paths = []
+
+        for entry in entries:
+            if entry is None:
+                continue
+            # yt-dlp для фото в Instagram отдаёт "ext" типа jpg/webp без видеоформата
+            ext = entry.get("ext", "")
+            filename = ydl.prepare_filename(entry)
+            if not os.path.exists(filename):
+                # пробуем угадать реальное расширение
+                base = filename.rsplit(".", 1)[0]
+                for guess_ext in (ext, "mp4", "jpg", "webp", "png"):
+                    candidate = f"{base}.{guess_ext}"
+                    if os.path.exists(candidate):
+                        filename = candidate
+                        break
+
+            if not os.path.exists(filename):
+                continue
+
+            if ext in ("jpg", "jpeg", "png", "webp") or entry.get("vcodec") == "none":
+                image_paths.append(filename)
+            else:
+                video_paths.append(filename)
+
+        if image_paths and not video_paths:
+            return {"type": "images", "paths": image_paths}
+        if video_paths:
+            # Если в посте смесь видео и фото — берём всё как видео+фото отдельно,
+            # но в большинстве случаев Instagram-пост это либо видео, либо фото(-карусель)
+            return {"type": "video", "path": video_paths[0]}
+
+        raise yt_dlp.utils.DownloadError("Не найдено ни видео, ни фото в результате")
+
+def download_video_ytdlp(url: str, output_path: str) -> str:
+    """Простое скачивание видео через yt-dlp — используется как fallback для TikTok."""
+    ydl_opts = {
+        "outtmpl": output_path,
+        "format": "best[ext=mp4]/best",
+        "quiet": True,
+        "no_warnings": True,
+        "http_headers": YDL_HEADERS,
+    }
     with yt_dlp.YoutubeDL(ydl_opts) as ydl:
         info = ydl.extract_info(url, download=True)
         filename = ydl.prepare_filename(info)
@@ -306,8 +364,26 @@ async def process_url(update: Update, ctx: ContextTypes.DEFAULT_TYPE, url: str, 
         # ── Instagram и fallback для TikTok: yt-dlp ──────────────────────────
         await status_msg.edit_text("⏬ Скачиваю...")
         with tempfile.TemporaryDirectory() as tmpdir:
-            output_path = os.path.join(tmpdir, "video.%(ext)s")
-            filepath = download_video_ytdlp(url, output_path)
+            if platform == "instagram":
+                result = download_instagram_ytdlp(url, tmpdir)
+
+                if result["type"] == "images":
+                    paths = result["paths"]
+                    await status_msg.edit_text(f"🖼 Отправляю {len(paths)} фото...")
+                    media_group = []
+                    for i, path in enumerate(paths[:10]):
+                        with open(path, "rb") as f:
+                            caption = "✅ Готово" if i == 0 else None
+                            media_group.append(InputMediaPhoto(media=f.read(), caption=caption))
+                    await msg.reply_media_group(media=media_group)
+                    await status_msg.delete()
+                    return
+
+                filepath = result["path"]
+            else:
+                output_path = os.path.join(tmpdir, "video.%(ext)s")
+                filepath = download_video_ytdlp(url, output_path)
+
             size_mb = os.path.getsize(filepath) / (1024 * 1024)
 
             if size_mb <= 50:
@@ -320,19 +396,12 @@ async def process_url(update: Update, ctx: ContextTypes.DEFAULT_TYPE, url: str, 
 
     except yt_dlp.utils.DownloadError as e:
         logger.warning(f"DownloadError для {url}: {e}")
-        extra = ""
-        if platform == "instagram":
-            extra = (
-                "\n\nInstagram часто требует авторизацию для скачивания.\n"
-                "Если ошибка повторяется — нужно подключить cookies "
-                "(см. переменную INSTAGRAM_COOKIES_FILE)."
-            )
         await status_msg.edit_text(
             "❌ Не удалось скачать.\n\n"
             "Возможные причины:\n"
             "• Видео/фото удалено, приватное или ограничено\n"
             "• Ссылка устарела\n\n"
-            "Попробуй скопировать ссылку заново." + extra
+            "Попробуй скопировать ссылку заново."
         )
     except Exception as e:
         logger.exception(f"Неожиданная ошибка: {e}")
