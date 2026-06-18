@@ -1,3 +1,4 @@
+import asyncio
 import logging
 import os
 import re
@@ -307,20 +308,22 @@ async def process_url(update: Update, ctx: ContextTypes.DEFAULT_TYPE, url: str, 
         await status_msg.edit_text("⚠️ Что-то пошло не так. Попробуй позже.")
 
 # ── Запуск ────────────────────────────────────────────────────────────────────
+async def cleanup_loop():
+    """Фоновая задача: чистит user_requests каждые 10 минут."""
+    while True:
+        await asyncio.sleep(600)
+        cleanup_rate_limits()
+
+async def on_startup(app):
+    asyncio.create_task(cleanup_loop())
+
 def main():
-    app = ApplicationBuilder().token(BOT_TOKEN).build()
+    app = ApplicationBuilder().token(BOT_TOKEN).post_init(on_startup).build()
 
     app.add_handler(CommandHandler("start", cmd_start))
     app.add_handler(CommandHandler("help", cmd_help))
     app.add_handler(CallbackQueryHandler(handle_check_sub, pattern="^check_sub$"))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
-
-    # Чистим user_requests каждые 10 минут
-    app.job_queue.run_repeating(
-        lambda ctx: cleanup_rate_limits(),
-        interval=600,
-        first=600,
-    )
 
     logger.info("Бот запущен")
     app.run_polling(drop_pending_updates=True)
