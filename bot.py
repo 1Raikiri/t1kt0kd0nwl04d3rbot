@@ -4,6 +4,7 @@ import os
 import re
 import time
 import tempfile
+import urllib.request
 from collections import defaultdict
 
 import aiohttp
@@ -166,57 +167,68 @@ def download_instagram_ytdlp(url: str, tmpdir: str) -> dict:
                       {"type": "images", "paths": [str, ...]}
     Поднимает yt_dlp.utils.DownloadError при неудаче.
     """
-    output_path = os.path.join(tmpdir, "media.%(ext)s")
-    ydl_opts = {
-        "outtmpl": output_path,
-        "format": "best[ext=mp4]/best",
+    base_opts = {
         "quiet": True,
         "no_warnings": True,
         "http_headers": YDL_HEADERS,
     }
     if INSTAGRAM_COOKIES_FILE:
-        ydl_opts["cookiefile"] = INSTAGRAM_COOKIES_FILE
+        base_opts["cookiefile"] = INSTAGRAM_COOKIES_FILE
 
-    with yt_dlp.YoutubeDL(ydl_opts) as ydl:
-        info = ydl.extract_info(url, download=True)
+    # ── Этап 1: разведка без скачивания, чтобы понять что внутри (видео/фото/карусель) ──
+    probe_opts = {**base_opts, "skip_download": True}
+    with yt_dlp.YoutubeDL(probe_opts) as ydl:
+        info = ydl.extract_info(url, download=False)
 
-        # Пост может быть каруселью из нескольких элементов (entries)
-        entries = info.get("entries") if info.get("_type") == "playlist" else [info]
+    entries = info.get("entries") if info.get("_type") == "playlist" else [info]
+    entries = [e for e in entries if e is not None]
 
-        video_paths = []
-        image_paths = []
-
-        for entry in entries:
-            if entry is None:
-                continue
-            # yt-dlp для фото в Instagram отдаёт "ext" типа jpg/webp без видеоформата
-            ext = entry.get("ext", "")
-            filename = ydl.prepare_filename(entry)
-            if not os.path.exists(filename):
-                # пробуем угадать реальное расширение
-                base = filename.rsplit(".", 1)[0]
-                for guess_ext in (ext, "mp4", "jpg", "webp", "png"):
-                    candidate = f"{base}.{guess_ext}"
-                    if os.path.exists(candidate):
-                        filename = candidate
-                        break
-
-            if not os.path.exists(filename):
-                continue
-
-            if ext in ("jpg", "jpeg", "png", "webp") or entry.get("vcodec") == "none":
-                image_paths.append(filename)
-            else:
-                video_paths.append(filename)
-
-        if image_paths and not video_paths:
-            return {"type": "images", "paths": image_paths}
-        if video_paths:
-            # Если в посте смесь видео и фото — берём всё как видео+фото отдельно,
-            # но в большинстве случаев Instagram-пост это либо видео, либо фото(-карусель)
-            return {"type": "video", "path": video_paths[0]}
-
+    if not entries:
         raise yt_dlp.utils.DownloadError("Не найдено ни видео, ни фото в результате")
+
+    video_paths = []
+    image_paths = []
+
+    for idx, entry in enumerate(entries):
+        # Фото в Instagram отдаётся без видеоформатов (formats пустой или только image)
+        formats = entry.get("formats") or []
+        has_video_format = any(f.get("vcodec") not in (None, "none") for f in formats)
+        is_image_entry = entry.get("vcodec") == "none" or not has_video_format
+
+        if is_image_entry:
+            # Прямая ссылка на изображение
+            img_url = entry.get("url") or (formats[-1].get("url") if formats else None)
+            if not img_url:
+                continue
+            ext = entry.get("ext") or "jpg"
+            dest = os.path.join(tmpdir, f"photo_{idx}.{ext}")
+            # Скачиваем напрямую — это просто статичный файл изображения
+            req = urllib.request.Request(img_url, headers=YDL_HEADERS)
+            with urllib.request.urlopen(req, timeout=20) as resp, open(dest, "wb") as f:
+                f.write(resp.read())
+            image_paths.append(dest)
+        else:
+            # Видео — скачиваем через yt-dlp с обычным выбором формата
+            entry_url = entry.get("webpage_url") or entry.get("url") or url
+            video_opts = {
+                **base_opts,
+                "outtmpl": os.path.join(tmpdir, f"video_{idx}.%(ext)s"),
+                "format": "best[ext=mp4]/best",
+            }
+            with yt_dlp.YoutubeDL(video_opts) as ydl_dl:
+                v_info = ydl_dl.extract_info(entry_url, download=True)
+                filename = ydl_dl.prepare_filename(v_info)
+                if not os.path.exists(filename):
+                    filename = filename.rsplit(".", 1)[0] + ".mp4"
+                if os.path.exists(filename):
+                    video_paths.append(filename)
+
+    if image_paths and not video_paths:
+        return {"type": "images", "paths": image_paths}
+    if video_paths:
+        return {"type": "video", "path": video_paths[0]}
+
+    raise yt_dlp.utils.DownloadError("Не найдено ни видео, ни фото в результате")
 
 def download_video_ytdlp(url: str, output_path: str) -> str:
     """Простое скачивание видео через yt-dlp — используется как fallback для TikTok."""
