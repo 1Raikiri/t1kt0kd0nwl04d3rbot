@@ -5,7 +5,7 @@ import time
 import tempfile
 from collections import defaultdict
 
-import requests
+import aiohttp
 import yt_dlp
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup, InputMediaPhoto
 from telegram.ext import (
@@ -36,8 +36,16 @@ TIKTOK_RE = re.compile(
     re.IGNORECASE,
 )
 
+INSTAGRAM_RE = re.compile(
+    r"https?://(www\.)?instagram\.com/(reel|reels|p|tv|stories)/\S+",
+    re.IGNORECASE,
+)
+
+# Опциональный файл с cookies для Instagram (нужен для части reels/историй,
+# которые Instagram отдаёт только авторизованным сессиям).
+INSTAGRAM_COOKIES_FILE = os.environ.get("INSTAGRAM_COOKIES_FILE")
+
 TIKWM_API = "https://www.tikwm.com/api/"
-TIKWM_BASE_URL = "https://www.tikwm.com"
 TIKWM_HEADERS = {
     "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
     "Accept": "application/json, text/javascript, */*; q=0.01",
@@ -58,7 +66,19 @@ def is_rate_limited(user_id: int) -> bool:
     if len(user_requests[user_id]) >= RATE_LIMIT:
         return True
     user_requests[user_id].append(now)
+    # Удаляем пустые записи, чтобы словарь не рос бесконечно
+    if not user_requests[user_id]:
+        del user_requests[user_id]
     return False
+
+def cleanup_rate_limits():
+    """Удаляет устаревшие записи из user_requests. Вызывается по расписанию."""
+    now = time.time()
+    stale = [uid for uid, times in user_requests.items() if not any(now - t < RATE_WINDOW for t in times)]
+    for uid in stale:
+        del user_requests[uid]
+    if stale:
+        logger.info(f"cleanup_rate_limits: удалено {len(stale)} устаревших записей")
 
 # ── Проверка подписки ─────────────────────────────────────────────────────────
 async def is_subscribed(user_id: int, ctx: ContextTypes.DEFAULT_TYPE) -> bool:
@@ -74,38 +94,37 @@ def subscription_keyboard() -> InlineKeyboardMarkup:
         [InlineKeyboardButton("✅ Я подписался", callback_data="check_sub")],
     ])
 
-# ── tikwm: нормализация ссылок ────────────────────────────────────────────────
-def tikwm_full_url(url: str | None) -> str | None:
-    """tikwm иногда отдаёт относительные пути (начинаются с '/') вместо полных
-    URL. requests падает на таких ссылках с MissingSchema — здесь достраиваем
-    хост, если его не было."""
-    if not url:
-        return url
-    if url.startswith("http://") or url.startswith("https://"):
-        return url
-    return TIKWM_BASE_URL + url
-
 # ── tikwm API (видео + фото) ──────────────────────────────────────────────────
-def tikwm_fetch(url: str) -> dict | None:
+async def tikwm_fetch(url: str) -> dict | None:
     """Получает данные через tikwm.com API. Возвращает data dict или None."""
     try:
-        resp = requests.post(
-            TIKWM_API,
-            data={"url": url, "count": 12, "cursor": 0, "web": 1, "hd": 1},
-            headers=TIKWM_HEADERS,
-            timeout=20,
-        )
-        if resp.status_code != 200:
-            logger.warning(f"tikwm вернул {resp.status_code}")
-            return None
-        j = resp.json()
-        if j.get("code") != 0:
-            logger.warning(f"tikwm error: {j.get('msg')}")
-            return None
-        return j.get("data")
+        async with aiohttp.ClientSession(headers=TIKWM_HEADERS) as session:
+            async with session.post(
+                TIKWM_API,
+                data={"url": url, "count": 12, "cursor": 0, "web": 1, "hd": 1},
+                timeout=aiohttp.ClientTimeout(total=20),
+            ) as resp:
+                if resp.status != 200:
+                    logger.warning(f"tikwm вернул {resp.status}")
+                    return None
+                j = await resp.json()
+                if j.get("code") != 0:
+                    logger.warning(f"tikwm error: {j.get('msg')}")
+                    return None
+                return j.get("data")
     except Exception as e:
         logger.warning(f"tikwm exception: {e}")
         return None
+
+def detect_url(text: str) -> tuple[str | None, str | None]:
+    """Определяет платформу и ссылку в тексте сообщения."""
+    match = TIKTOK_RE.search(text)
+    if match:
+        return "tiktok", match.group(0)
+    match = INSTAGRAM_RE.search(text)
+    if match:
+        return "instagram", match.group(0)
+    return None, None
 
 # ── yt-dlp скачивание видео ───────────────────────────────────────────────────
 def download_video_ytdlp(url: str, output_path: str) -> str:
@@ -116,6 +135,8 @@ def download_video_ytdlp(url: str, output_path: str) -> str:
         "no_warnings": True,
         "http_headers": YDL_HEADERS,
     }
+    if INSTAGRAM_COOKIES_FILE and "instagram.com" in url:
+        ydl_opts["cookiefile"] = INSTAGRAM_COOKIES_FILE
     with yt_dlp.YoutubeDL(ydl_opts) as ydl:
         info = ydl.extract_info(url, download=True)
         filename = ydl.prepare_filename(info)
@@ -126,16 +147,21 @@ def download_video_ytdlp(url: str, output_path: str) -> str:
 # ── Хэндлеры ─────────────────────────────────────────────────────────────────
 async def cmd_start(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(
-        "👋 Привет! Я скачиваю из TikTok:\n\n"
-        "🎬 Видео — без водяного знака\n"
-        "🖼 Фото карусели — все фото сразу\n\n"
+        "👋 Привет! Я скачиваю видео и фото:\n\n"
+        "🎵 TikTok — видео и фото-карусели без водяного знака\n"
+        "📸 Instagram — Reels и посты\n\n"
         "Просто отправь ссылку!"
     )
 
 async def cmd_help(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(
         "ℹ️ *Как пользоваться:*\n\n"
+        "*TikTok:*\n"
         "1. Открой TikTok и найди нужное видео или фото\n"
+        "2. Нажми «Поделиться» → «Скопировать ссылку»\n"
+        "3. Отправь ссылку сюда\n\n"
+        "*Instagram:*\n"
+        "1. Открой Reels или пост\n"
         "2. Нажми «Поделиться» → «Скопировать ссылку»\n"
         "3. Отправь ссылку сюда",
         parse_mode="Markdown",
@@ -145,11 +171,12 @@ async def handle_message(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     user = update.effective_user
     text = update.message.text or ""
 
-    match = TIKTOK_RE.search(text)
-    if not match:
+    platform, url = detect_url(text)
+    if not url:
         await update.message.reply_text(
-            "🤔 Не вижу ссылки на TikTok.\n"
-            "Отправь ссылку вида: https://vm.tiktok.com/..."
+            "🤔 Не вижу ссылки на TikTok или Instagram.\n"
+            "Отправь ссылку вида: https://vm.tiktok.com/... "
+            "или https://instagram.com/reel/..."
         )
         return
 
@@ -159,10 +186,11 @@ async def handle_message(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
             "После подписки нажми кнопку «Я подписался» ✅",
             reply_markup=subscription_keyboard(),
         )
-        ctx.user_data["pending_url"] = match.group(0)
+        ctx.user_data["pending_url"] = url
+        ctx.user_data["pending_platform"] = platform
         return
 
-    await process_url(update, ctx, match.group(0))
+    await process_url(update, ctx, url, platform)
 
 async def handle_check_sub(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
@@ -177,13 +205,14 @@ async def handle_check_sub(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         )
         return
 
-    await query.edit_message_text("✅ Спасибо за подписку! Теперь отправь ссылку на TikTok.")
+    await query.edit_message_text("✅ Спасибо за подписку! Обрабатываю твою ссылку...")
 
     pending_url = ctx.user_data.pop("pending_url", None)
+    pending_platform = ctx.user_data.pop("pending_platform", None)
     if pending_url:
-        await process_url(update, ctx, pending_url)
+        await process_url(update, ctx, pending_url, pending_platform)
 
-async def process_url(update: Update, ctx: ContextTypes.DEFAULT_TYPE, url: str):
+async def process_url(update: Update, ctx: ContextTypes.DEFAULT_TYPE, url: str, platform: str = "tiktok"):
     user = update.effective_user
 
     if is_rate_limited(user.id):
@@ -193,53 +222,57 @@ async def process_url(update: Update, ctx: ContextTypes.DEFAULT_TYPE, url: str):
 
     msg = update.message or update.callback_query.message
     status_msg = await msg.reply_text("⏳ Обрабатываю ссылку...")
-    logger.info(f"User {user.id} (@{user.username}) запросил: {url}")
+    logger.info(f"User {user.id} (@{user.username}) запросил [{platform}]: {url}")
 
     try:
-        # ── Пробуем tikwm API (работает и для фото и для видео) ──────────────
-        data = tikwm_fetch(url)
+        # ── TikTok: сначала пробуем tikwm API (видео + фото-карусели) ────────
+        if platform == "tiktok":
+            data = await tikwm_fetch(url)
 
-        if data:
-            images = data.get("images")  # список URL фото если это карусель
+            if data:
+                images = data.get("images")
 
-            # ── Фото карусель ─────────────────────────────────────────────────
-            if images:
-                await status_msg.edit_text(f"🖼 Отправляю {len(images)} фото...")
-                media_group = []
-                for i, img_url in enumerate(images[:10]):
-                    img_resp = requests.get(tikwm_full_url(img_url), headers=TIKWM_HEADERS, timeout=15)
-                    caption = "🖼 Без водяного знака" if i == 0 else None
-                    media_group.append(InputMediaPhoto(media=img_resp.content, caption=caption))
-                await msg.reply_media_group(media=media_group)
-                await status_msg.delete()
-                return
-
-            # ── Видео через tikwm ─────────────────────────────────────────────
-            play_url = tikwm_full_url(data.get("hdplay") or data.get("play"))
-            if play_url:
-                await status_msg.edit_text("⏬ Скачиваю видео...")
-                video_resp = requests.get(play_url, headers=TIKWM_HEADERS, timeout=60, stream=True)
-                content = video_resp.content
-                size_mb = len(content) / (1024 * 1024)
-
-                if size_mb <= 50:
-                    await status_msg.edit_text("📤 Отправляю...")
-                    await msg.reply_video(
-                        video=content,
-                        caption="✅ Без водяного знака",
-                        supports_streaming=True,
-                    )
+                # ── Фото карусель ─────────────────────────────────────────
+                if images:
+                    await status_msg.edit_text(f"🖼 Отправляю {len(images)} фото...")
+                    media_group = []
+                    async with aiohttp.ClientSession(headers=TIKWM_HEADERS) as session:
+                        for i, img_url in enumerate(images[:10]):
+                            async with session.get(img_url, timeout=aiohttp.ClientTimeout(total=15)) as img_resp:
+                                img_bytes = await img_resp.read()
+                            caption = "🖼 Без водяного знака" if i == 0 else None
+                            media_group.append(InputMediaPhoto(media=img_bytes, caption=caption))
+                    await msg.reply_media_group(media=media_group)
                     await status_msg.delete()
-                else:
-                    await msg.reply_text(
-                        f"📹 Видео слишком большое ({size_mb:.1f} МБ).\n"
-                        f"Скачай по ссылке:\n{play_url}"
-                    )
-                    await status_msg.delete()
-                return
+                    return
 
-        # ── Fallback: yt-dlp для видео ────────────────────────────────────────
-        await status_msg.edit_text("⏬ Скачиваю через резервный метод...")
+                # ── Видео через tikwm ────────────────────────────────────
+                play_url = data.get("hdplay") or data.get("play")
+                if play_url:
+                    await status_msg.edit_text("⏬ Скачиваю видео...")
+                    async with aiohttp.ClientSession(headers=TIKWM_HEADERS) as session:
+                        async with session.get(play_url, timeout=aiohttp.ClientTimeout(total=60)) as video_resp:
+                            content = await video_resp.read()
+                    size_mb = len(content) / (1024 * 1024)
+
+                    if size_mb <= 50:
+                        await status_msg.edit_text("📤 Отправляю...")
+                        await msg.reply_video(
+                            video=content,
+                            caption="✅ Без водяного знака",
+                            supports_streaming=True,
+                        )
+                        await status_msg.delete()
+                    else:
+                        await msg.reply_text(
+                            f"📹 Видео слишком большое ({size_mb:.1f} МБ).\n"
+                            f"Скачай по ссылке:\n{play_url}"
+                        )
+                        await status_msg.delete()
+                    return
+
+        # ── Instagram и fallback для TikTok: yt-dlp ──────────────────────────
+        await status_msg.edit_text("⏬ Скачиваю...")
         with tempfile.TemporaryDirectory() as tmpdir:
             output_path = os.path.join(tmpdir, "video.%(ext)s")
             filepath = download_video_ytdlp(url, output_path)
@@ -248,22 +281,29 @@ async def process_url(update: Update, ctx: ContextTypes.DEFAULT_TYPE, url: str):
             if size_mb <= 50:
                 await status_msg.edit_text("📤 Отправляю...")
                 with open(filepath, "rb") as f:
-                    await msg.reply_video(video=f, caption="✅ Без водяного знака", supports_streaming=True)
+                    await msg.reply_video(video=f, caption="✅ Готово", supports_streaming=True)
                 await status_msg.delete()
             else:
                 await status_msg.edit_text(f"😔 Видео слишком большое ({size_mb:.1f} МБ) для Telegram.")
 
     except yt_dlp.utils.DownloadError as e:
         logger.warning(f"DownloadError для {url}: {e}")
+        extra = ""
+        if platform == "instagram":
+            extra = (
+                "\n\nInstagram часто требует авторизацию для скачивания.\n"
+                "Если ошибка повторяется — нужно подключить cookies "
+                "(см. переменную INSTAGRAM_COOKIES_FILE)."
+            )
         await status_msg.edit_text(
             "❌ Не удалось скачать.\n\n"
             "Возможные причины:\n"
-            "• Видео/фото удалено или приватное\n"
+            "• Видео/фото удалено, приватное или ограничено\n"
             "• Ссылка устарела\n\n"
-            "Попробуй скопировать ссылку заново."
+            "Попробуй скопировать ссылку заново." + extra
         )
-    except Exception:
-        logger.exception("Неожиданная ошибка")
+    except Exception as e:
+        logger.exception(f"Неожиданная ошибка: {e}")
         await status_msg.edit_text("⚠️ Что-то пошло не так. Попробуй позже.")
 
 # ── Запуск ────────────────────────────────────────────────────────────────────
@@ -274,6 +314,13 @@ def main():
     app.add_handler(CommandHandler("help", cmd_help))
     app.add_handler(CallbackQueryHandler(handle_check_sub, pattern="^check_sub$"))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
+
+    # Чистим user_requests каждые 10 минут
+    app.job_queue.run_repeating(
+        lambda ctx: cleanup_rate_limits(),
+        interval=600,
+        first=600,
+    )
 
     logger.info("Бот запущен")
     app.run_polling(drop_pending_updates=True)
