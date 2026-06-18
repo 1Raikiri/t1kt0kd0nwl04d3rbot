@@ -349,12 +349,46 @@ async def process_url(update: Update, ctx: ContextTypes.DEFAULT_TYPE, url: str, 
                     return
 
                 # ── Видео через tikwm ────────────────────────────────────
-                play_url = data.get("hdplay") or data.get("play")
-                if play_url:
-                    await status_msg.edit_text("⏬ Скачиваю видео...")
-                    async with aiohttp.ClientSession(headers=TIKWM_HEADERS) as session:
-                        async with session.get(play_url, timeout=aiohttp.ClientTimeout(total=60)) as video_resp:
-                            content = await video_resp.read()
+               play_url = data.get("hdplay") or data.get("play")
+
+# tikwm иногда возвращает относительный путь
+if play_url and play_url.startswith("/"):
+    play_url = "https://www.tikwm.com" + play_url
+
+if play_url:
+    await status_msg.edit_text("⏬ Скачиваю видео...")
+
+    async with aiohttp.ClientSession(headers=TIKWM_HEADERS) as session:
+        async with session.get(
+            play_url,
+            timeout=aiohttp.ClientTimeout(total=60),
+        ) as video_resp:
+
+            if video_resp.status != 200:
+                raise Exception(
+                    f"Не удалось скачать видео. HTTP {video_resp.status}"
+                )
+
+            content = await video_resp.read()
+
+    size_mb = len(content) / (1024 * 1024)
+
+    if size_mb <= 50:
+        await status_msg.edit_text("📤 Отправляю...")
+        await msg.reply_video(
+            video=content,
+            caption="✅ Без водяного знака",
+            supports_streaming=True,
+        )
+        await status_msg.delete()
+    else:
+        await msg.reply_text(
+            f"📹 Видео слишком большое ({size_mb:.1f} МБ).\n"
+            f"Скачай по ссылке:\n{play_url}"
+        )
+        await status_msg.delete()
+
+    return
                     size_mb = len(content) / (1024 * 1024)
 
                     if size_mb <= 50:
