@@ -8,8 +8,9 @@ import urllib.request
 from collections import defaultdict
 
 import aiohttp
+import instaloader
 import yt_dlp
-from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup, InputMediaPhoto
+from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup, InputMediaPhoto, InputMediaVideo
 from telegram.ext import (
     ApplicationBuilder,
     CommandHandler,
@@ -159,76 +160,105 @@ def detect_url(text: str) -> tuple[str | None, str | None]:
         return "instagram", match.group(0)
     return None, None
 
-# ── yt-dlp скачивание видео/фото ──────────────────────────────────────────────
-def download_instagram_ytdlp(url: str, tmpdir: str) -> dict:
+# ── Instaloader: единая точка авторизации для Instagram ──────────────────────
+_instaloader_instance = None
+
+def get_instaloader() -> instaloader.Instaloader:
+    """Создаёт (один раз) и возвращает авторизованный экземпляр Instaloader."""
+    global _instaloader_instance
+    if _instaloader_instance is not None:
+        return _instaloader_instance
+
+    L = instaloader.Instaloader(
+        download_videos=True,
+        download_video_thumbnails=False,
+        download_geotags=False,
+        download_comments=False,
+        save_metadata=False,
+        compress_json=False,
+        post_metadata_txt_pattern="",
+        quiet=True,
+    )
+    if INSTAGRAM_COOKIES_FILE and os.path.exists(INSTAGRAM_COOKIES_FILE):
+        try:
+            import http.cookiejar
+            cj = http.cookiejar.MozillaCookieJar(INSTAGRAM_COOKIES_FILE)
+            cj.load(ignore_discard=True, ignore_expires=True)
+            L.context._session.cookies.update(cj)
+            # csrftoken должен совпадать с тем, что в cookies, иначе запросы 403-ятся
+            csrf = next((c.value for c in cj if c.name == "csrftoken"), None)
+            if csrf:
+                L.context._session.headers.update({"X-CSRFToken": csrf})
+            logger.info("Instaloader: cookies загружены успешно")
+        except Exception as e:
+            logger.warning(f"Instaloader: не удалось загрузить cookies: {e}")
+
+    _instaloader_instance = L
+    return L
+
+_SHORTCODE_RE = re.compile(r"instagram\.com/(?:reel|reels|p|tv)/([A-Za-z0-9_-]+)")
+
+def extract_shortcode(url: str) -> str | None:
+    match = _SHORTCODE_RE.search(url)
+    return match.group(1) if match else None
+
+def download_instagram_post(url: str, tmpdir: str) -> dict:
     """
-    Скачивает контент из Instagram через yt-dlp.
+    Скачивает контент из Instagram (reels, посты, карусели) через instaloader.
     Возвращает dict: {"type": "video", "path": str} или
                       {"type": "images", "paths": [str, ...]}
-    Поднимает yt_dlp.utils.DownloadError при неудаче.
+    Поднимает RuntimeError при неудаче.
     """
-    base_opts = {
-        "quiet": True,
-        "no_warnings": True,
-        "http_headers": YDL_HEADERS,
-    }
-    if INSTAGRAM_COOKIES_FILE:
-        base_opts["cookiefile"] = INSTAGRAM_COOKIES_FILE
+    shortcode = extract_shortcode(url)
+    if not shortcode:
+        raise RuntimeError("Не удалось определить shortcode из ссылки")
 
-    # ── Этап 1: разведка без скачивания, чтобы понять что внутри (видео/фото/карусель) ──
-    probe_opts = {**base_opts, "skip_download": True}
-    with yt_dlp.YoutubeDL(probe_opts) as ydl:
-        info = ydl.extract_info(url, download=False)
-
-    entries = info.get("entries") if info.get("_type") == "playlist" else [info]
-    entries = [e for e in entries if e is not None]
-
-    if not entries:
-        raise yt_dlp.utils.DownloadError("Не найдено ни видео, ни фото в результате")
+    L = get_instaloader()
+    try:
+        post = instaloader.Post.from_shortcode(L.context, shortcode)
+    except Exception as e:
+        raise RuntimeError(f"Instagram отказал в доступе к посту: {e}")
 
     video_paths = []
     image_paths = []
 
-    for idx, entry in enumerate(entries):
-        # Фото в Instagram отдаётся без видеоформатов (formats пустой или только image)
-        formats = entry.get("formats") or []
-        has_video_format = any(f.get("vcodec") not in (None, "none") for f in formats)
-        is_image_entry = entry.get("vcodec") == "none" or not has_video_format
+    def _download_url(media_url: str, dest: str):
+        req = urllib.request.Request(media_url, headers=YDL_HEADERS)
+        with urllib.request.urlopen(req, timeout=30) as resp, open(dest, "wb") as f:
+            f.write(resp.read())
 
-        if is_image_entry:
-            # Прямая ссылка на изображение
-            img_url = entry.get("url") or (formats[-1].get("url") if formats else None)
-            if not img_url:
-                continue
-            ext = entry.get("ext") or "jpg"
-            dest = os.path.join(tmpdir, f"photo_{idx}.{ext}")
-            # Скачиваем напрямую — это просто статичный файл изображения
-            req = urllib.request.Request(img_url, headers=YDL_HEADERS)
-            with urllib.request.urlopen(req, timeout=20) as resp, open(dest, "wb") as f:
-                f.write(resp.read())
-            image_paths.append(dest)
+    try:
+        if post.typename == "GraphSidecar":
+            # Карусель из нескольких фото/видео
+            for idx, node in enumerate(post.get_sidecar_nodes()):
+                if node.is_video:
+                    dest = os.path.join(tmpdir, f"video_{idx}.mp4")
+                    _download_url(node.video_url, dest)
+                    video_paths.append(dest)
+                else:
+                    dest = os.path.join(tmpdir, f"photo_{idx}.jpg")
+                    _download_url(node.display_url, dest)
+                    image_paths.append(dest)
+        elif post.is_video:
+            dest = os.path.join(tmpdir, "video.mp4")
+            _download_url(post.video_url, dest)
+            video_paths.append(dest)
         else:
-            # Видео — скачиваем через yt-dlp с обычным выбором формата
-            entry_url = entry.get("webpage_url") or entry.get("url") or url
-            video_opts = {
-                **base_opts,
-                "outtmpl": os.path.join(tmpdir, f"video_{idx}.%(ext)s"),
-                "format": "best[ext=mp4]/best",
-            }
-            with yt_dlp.YoutubeDL(video_opts) as ydl_dl:
-                v_info = ydl_dl.extract_info(entry_url, download=True)
-                filename = ydl_dl.prepare_filename(v_info)
-                if not os.path.exists(filename):
-                    filename = filename.rsplit(".", 1)[0] + ".mp4"
-                if os.path.exists(filename):
-                    video_paths.append(filename)
+            dest = os.path.join(tmpdir, "photo.jpg")
+            _download_url(post.url, dest)
+            image_paths.append(dest)
+    except Exception as e:
+        raise RuntimeError(f"Ошибка при скачивании медиа: {e}")
 
     if image_paths and not video_paths:
         return {"type": "images", "paths": image_paths}
-    if video_paths:
+    if video_paths and not image_paths:
         return {"type": "video", "path": video_paths[0]}
+    if video_paths:
+        # Смешанная карусель — пока отправляем как фото-альбом, видео можно добавить позже
+        return {"type": "images", "paths": image_paths + video_paths}
 
-    raise yt_dlp.utils.DownloadError("Не найдено ни видео, ни фото в результате")
+    raise RuntimeError("Не найдено ни видео, ни фото в посте")
 
 def download_video_ytdlp(url: str, output_path: str) -> str:
     """Простое скачивание видео через yt-dlp — используется как fallback для TikTok."""
@@ -349,46 +379,12 @@ async def process_url(update: Update, ctx: ContextTypes.DEFAULT_TYPE, url: str, 
                     return
 
                 # ── Видео через tikwm ────────────────────────────────────
-               play_url = data.get("hdplay") or data.get("play")
-
-# tikwm иногда возвращает относительный путь
-if play_url and play_url.startswith("/"):
-    play_url = "https://www.tikwm.com" + play_url
-
-if play_url:
-    await status_msg.edit_text("⏬ Скачиваю видео...")
-
-    async with aiohttp.ClientSession(headers=TIKWM_HEADERS) as session:
-        async with session.get(
-            play_url,
-            timeout=aiohttp.ClientTimeout(total=60),
-        ) as video_resp:
-
-            if video_resp.status != 200:
-                raise Exception(
-                    f"Не удалось скачать видео. HTTP {video_resp.status}"
-                )
-
-            content = await video_resp.read()
-
-    size_mb = len(content) / (1024 * 1024)
-
-    if size_mb <= 50:
-        await status_msg.edit_text("📤 Отправляю...")
-        await msg.reply_video(
-            video=content,
-            caption="✅ Без водяного знака",
-            supports_streaming=True,
-        )
-        await status_msg.delete()
-    else:
-        await msg.reply_text(
-            f"📹 Видео слишком большое ({size_mb:.1f} МБ).\n"
-            f"Скачай по ссылке:\n{play_url}"
-        )
-        await status_msg.delete()
-
-    return
+                play_url = data.get("hdplay") or data.get("play")
+                if play_url:
+                    await status_msg.edit_text("⏬ Скачиваю видео...")
+                    async with aiohttp.ClientSession(headers=TIKWM_HEADERS) as session:
+                        async with session.get(play_url, timeout=aiohttp.ClientTimeout(total=60)) as video_resp:
+                            content = await video_resp.read()
                     size_mb = len(content) / (1024 * 1024)
 
                     if size_mb <= 50:
@@ -407,20 +403,24 @@ if play_url:
                         await status_msg.delete()
                     return
 
-        # ── Instagram и fallback для TikTok: yt-dlp ──────────────────────────
+        # ── Instagram: instaloader, TikTok fallback: yt-dlp ──────────────────
         await status_msg.edit_text("⏬ Скачиваю...")
         with tempfile.TemporaryDirectory() as tmpdir:
             if platform == "instagram":
-                result = download_instagram_ytdlp(url, tmpdir)
+                result = await asyncio.to_thread(download_instagram_post, url, tmpdir)
 
                 if result["type"] == "images":
                     paths = result["paths"]
-                    await status_msg.edit_text(f"🖼 Отправляю {len(paths)} фото...")
+                    await status_msg.edit_text(f"🖼 Отправляю {len(paths)} файл(ов)...")
                     media_group = []
                     for i, path in enumerate(paths[:10]):
                         with open(path, "rb") as f:
-                            caption = "✅ Готово" if i == 0 else None
-                            media_group.append(InputMediaPhoto(media=f.read(), caption=caption))
+                            data = f.read()
+                        caption = "✅ Готово" if i == 0 else None
+                        if path.endswith(".mp4"):
+                            media_group.append(InputMediaVideo(media=data, caption=caption))
+                        else:
+                            media_group.append(InputMediaPhoto(media=data, caption=caption))
                     await msg.reply_media_group(media=media_group)
                     await status_msg.delete()
                     return
@@ -428,7 +428,7 @@ if play_url:
                 filepath = result["path"]
             else:
                 output_path = os.path.join(tmpdir, "video.%(ext)s")
-                filepath = download_video_ytdlp(url, output_path)
+                filepath = await asyncio.to_thread(download_video_ytdlp, url, output_path)
 
             size_mb = os.path.getsize(filepath) / (1024 * 1024)
 
@@ -442,6 +442,15 @@ if play_url:
 
     except yt_dlp.utils.DownloadError as e:
         logger.warning(f"DownloadError для {url}: {e}")
+        await status_msg.edit_text(
+            "❌ Не удалось скачать.\n\n"
+            "Возможные причины:\n"
+            "• Видео/фото удалено, приватное или ограничено\n"
+            "• Ссылка устарела\n\n"
+            "Попробуй скопировать ссылку заново."
+        )
+    except RuntimeError as e:
+        logger.warning(f"Instagram ошибка для {url}: {e}")
         await status_msg.edit_text(
             "❌ Не удалось скачать.\n\n"
             "Возможные причины:\n"
