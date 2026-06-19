@@ -378,13 +378,22 @@ async def process_url(update: Update, ctx: ContextTypes.DEFAULT_TYPE, url: str, 
                     await status_msg.delete()
                     return
 
-                # ── Видео через tikwm ────────────────────────────────────
-                play_url = data.get("hdplay") or data.get("play")
-                if play_url:
-                    await status_msg.edit_text("⏬ Скачиваю видео...")
-                    async with aiohttp.ClientSession(headers=TIKWM_HEADERS) as session:
-                        async with session.get(play_url, timeout=aiohttp.ClientTimeout(total=60)) as video_resp:
-                            content = await video_resp.read()
+               # ── Видео через tikwm ────────────────────────────────────
+play_url = data.get("hdplay") or data.get("play")
+if play_url:
+    # Нормализуем URL
+    if not play_url.startswith(('http://', 'https://')):
+        # Убираем ведущий слэш, если он есть
+        clean_path = play_url.lstrip('/')
+        play_url = f'https://www.tikwm.com/{clean_path}'
+    
+    logger.info(f"Загрузка видео по URL: {play_url}")
+    await status_msg.edit_text("⏬ Скачиваю видео...")
+    async with aiohttp.ClientSession(headers=TIKWM_HEADERS) as session:
+        async with session.get(play_url, timeout=aiohttp.ClientTimeout(total=60)) as video_resp:
+            if video_resp.status != 200:
+                raise Exception(f"Не удалось загрузить видео: статус {video_resp.status}")
+            content = await video_resp.read()
                     size_mb = len(content) / (1024 * 1024)
 
                     if size_mb <= 50:
